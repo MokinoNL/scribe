@@ -25,7 +25,7 @@ create table if not exists printers (
   id           uuid primary key default gen_random_uuid(),
   household_id uuid not null references households(id) on delete cascade,
   name         text not null default 'Scribe Printer',
-  api_key      text unique not null default encode(gen_random_bytes(32), 'hex'),
+  api_key      text unique not null default replace(gen_random_uuid()::text || gen_random_uuid()::text, '-', ''),
   last_seen    timestamptz,
   created_at   timestamptz default now()
 );
