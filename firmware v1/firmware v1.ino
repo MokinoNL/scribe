@@ -1,8 +1,11 @@
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
+#include <ESP8266HTTPClient.h>
+#include <WiFiClientSecure.h>
 #include <WiFiUdp.h>
 #include <NTPClient.h>
 #include <SoftwareSerial.h>
+#include <ArduinoJson.h>
 
 // === Function Declarations ===
 void connectToWiFi();
@@ -19,10 +22,24 @@ void setInverse(bool enable);
 void printLine(String line);
 void advancePaper(int lines);
 void printWrappedUpsideDown(String text);
+// Cloud print queue
+void pollPrintJobs();
+void printJobList(String title, JsonArray items);
+void printJobMessage(String message);
+void markJobDone(String jobId, String status);
 
 // === WiFi Configuration ===
-const char* ssid = "Your WIFI name";
+const char* ssid     = "Your WIFI name";
 const char* password = "Your WIFI password";
+
+// === Supabase Cloud Print Queue ===
+// Fill these in from the Scribe app Settings → Printer → View credentials
+const char* supabaseUrl = "https://YOUR_PROJECT_ID.supabase.co";
+const char* printerId   = "YOUR_PRINTER_ID";
+const char* apiKey      = "YOUR_API_KEY";
+
+const unsigned long POLL_INTERVAL_MS = 10000; // Poll every 10 seconds
+unsigned long lastPollTime = 0;
 
 // === Time Configuration ===
 const long utcOffsetInSeconds = 0; // UTC offset in seconds (0 for UTC, 3600 for UTC+1, etc.)
@@ -36,7 +53,7 @@ ESP8266WebServer server(80);
 SoftwareSerial printer(D4, D3); // Use D4 (TX, GPIO2), D3 (RX, GPIO0)
 const int maxCharsPerLine = 32;
 
-// === Storage for form data ===
+// === Storage for form data (local web UI) ===
 struct Receipt {
   String message;
   String timestamp;
@@ -48,60 +65,67 @@ Receipt currentReceipt = {"", "", false};
 void setup() {
   Serial.begin(115200);
   Serial.println("\n=== Thermal Printer Server Starting ===");
-  
+
   // Initialize printer
   initializePrinter();
-  
+
   // Connect to WiFi
   connectToWiFi();
-  
+
   // Initialize time client
   timeClient.begin();
   Serial.println("Time client initialized");
-  
+
   // Setup web server routes
   setupWebServer();
-  
+
   // Start the server
   server.begin();
   Serial.println("Web server started");
-  
+
   // Print server info
   printServerInfo();
-  
+
   Serial.println("=== Setup Complete ===");
 }
 
 void loop() {
-  // Handle web server requests
+  // Handle local web server requests
   server.handleClient();
-  
+
   // Update time client
   timeClient.update();
-  
-  // Check if we have a new receipt to print
+
+  // Print any receipt queued via the local web UI
   if (currentReceipt.hasData) {
     printReceipt();
-    currentReceipt.hasData = false; // Reset flag
+    currentReceipt.hasData = false;
   }
-  
-  delay(10); // Small delay to prevent excessive CPU usage
+
+  // Poll Supabase cloud queue for print jobs submitted via the app
+  unsigned long now = millis();
+  if (WiFi.status() == WL_CONNECTED && now - lastPollTime >= POLL_INTERVAL_MS) {
+    lastPollTime = now;
+    pollPrintJobs();
+  }
+
+  delay(10);
 }
 
 // === WiFi Connection ===
 void connectToWiFi() {
   Serial.print("Connecting to WiFi: ");
   Serial.println(ssid);
-  
+
   WiFi.begin(ssid, password);
-  
+
   int attempts = 0;
   while (WiFi.status() != WL_CONNECTED && attempts < 30) {
     delay(1000);
     Serial.print(".");
     attempts++;
   }
-  
+
   if (WiFi.status() == WL_CONNECTED) {
     Serial.println();
     Serial.println("WiFi connected successfully!");
@@ -115,16 +139,9 @@ void connectToWiFi() {
 
 // === Web Server Setup ===
 void setupWebServer() {
-  // Serve the main page
   server.on("/", HTTP_GET, handleRoot);
-  
-  // Handle form submission
   server.on("/submit", HTTP_POST, handleSubmit);
-
-  // ADD THIS LINE to also handle submission via URL
   server.on("/submit", HTTP_GET, handleSubmit);
-  
-  // Handle 404
   server.onNotFound(handle404);
 }
 
@@ -211,15 +228,14 @@ void handleRoot() {
 </body>
 </html>
 )rawliteral";
-  
+
   server.send(200, "text/html", html);
 }
 
 void handleSubmit() {
   if (server.hasArg("message")) {
     currentReceipt.message = server.arg("message");
-    
-    // Check if a custom date was provided
+
     if (server.hasArg("date")) {
       String customDate = server.arg("date");
       currentReceipt.timestamp = formatCustomDate(customDate);
@@ -228,14 +244,14 @@ void handleSubmit() {
       currentReceipt.timestamp = getFormattedDateTime();
       Serial.println("Using current date");
     }
-    
+
     currentReceipt.hasData = true;
-    
+
     Serial.println("=== New Receipt Received ===");
     Serial.println("Message: " + currentReceipt.message);
     Serial.println("Time: " + currentReceipt.timestamp);
     Serial.println("============================");
-    
+
     server.send(200, "text/plain", "Receipt received and will be printed!");
   } else {
     server.send(400, "text/plain", "Missing message parameter");
@@ -246,80 +262,167 @@ void handle404() {
   server.send(404, "text/plain", "Page not found");
 }
 
+// === Cloud Print Queue Polling ===
+
+void pollPrintJobs() {
+  WiFiClientSecure client;
+  client.setInsecure(); // Skip certificate verification (sufficient for home use)
+
+  HTTPClient http;
+  String url = String(supabaseUrl)
+    + "/functions/v1/printer-jobs?printer_id=" + printerId
+    + "&api_key=" + apiKey;
+
+  http.begin(client, url);
+  http.setTimeout(8000);
+  int code = http.GET();
+
+  if (code != 200) {
+    Serial.println("Poll failed, HTTP " + String(code));
+    http.end();
+    return;
+  }
+
+  String payload = http.getString();
+  http.end();
+
+  DynamicJsonDocument doc(4096);
+  if (deserializeJson(doc, payload) != DeserializationError::Ok) {
+    Serial.println("JSON parse error");
+    return;
+  }
+
+  if (doc["job"].isNull()) {
+    return; // No pending jobs
+  }
+
+  String jobId = doc["job"]["id"].as<String>();
+  String type  = doc["job"]["type"].as<String>();
+  JsonObject content = doc["job"]["content"];
+
+  Serial.println("=== Cloud print job received ===");
+  Serial.println("Job ID: " + jobId);
+  Serial.println("Type: " + type);
+
+  if (type == "list") {
+    String title    = content["title"] | "List";
+    JsonArray items = content["items"];
+    printJobList(title, items);
+  } else if (type == "message") {
+    String message = content["message"] | "";
+    printJobMessage(message);
+  }
+
+  markJobDone(jobId, "done");
+  Serial.println("=== Job complete ===");
+}
+
+void printJobList(String title, JsonArray items) {
+  // Print each item first (they appear at the bottom after 180° rotation)
+  for (int i = items.size() - 1; i >= 0; i--) {
+    printWrappedUpsideDown(items[i].as<String>());
+  }
+
+  // Print title header last (appears at top after rotation)
+  setInverse(true);
+  printLine(title);
+  setInverse(false);
+
+  advancePaper(2);
+}
+
+void printJobMessage(String message) {
+  printWrappedUpsideDown(message);
+
+  setInverse(true);
+  printLine(getFormattedDateTime());
+  setInverse(false);
+
+  advancePaper(2);
+}
+
+void markJobDone(String jobId, String status) {
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient http;
+  String url = String(supabaseUrl)
+    + "/functions/v1/printer-jobs?api_key=" + apiKey;
+
+  http.begin(client, url);
+  http.addHeader("Content-Type", "application/json");
+  http.setTimeout(8000);
+
+  DynamicJsonDocument body(256);
+  body["job_id"] = jobId;
+  body["status"] = status;
+
+  String bodyStr;
+  serializeJson(body, bodyStr);
+
+  int code = http.POST(bodyStr);
+  if (code != 200) {
+    Serial.println("markJobDone failed, HTTP " + String(code));
+  }
+
+  http.end();
+}
+
 // === Time Utilities ===
 String getFormattedDateTime() {
   timeClient.update();
-  
-  // Get epoch time
+
   unsigned long epochTime = timeClient.getEpochTime();
-  
-  // Convert to struct tm
   time_t rawTime = epochTime;
   struct tm * timeInfo = gmtime(&rawTime);
-  
-  // Day names and month names
-  String dayNames[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+
+  String dayNames[]   = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
   String monthNames[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
-                        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
-  
-  // Format: "Sat, 06 Jun 2025"
+                         "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+
   String formatted = dayNames[timeInfo->tm_wday] + ", ";
   formatted += String(timeInfo->tm_mday < 10 ? "0" : "") + String(timeInfo->tm_mday) + " ";
   formatted += monthNames[timeInfo->tm_mon] + " ";
   formatted += String(timeInfo->tm_year + 1900);
-  
+
   return formatted;
 }
 
 String formatCustomDate(String customDate) {
-  // Expected format: YYYY-MM-DD or DD/MM/YYYY or similar
-  // This function will try to parse common date formats and return formatted string
-  
-  String dayNames[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+  String dayNames[]   = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
   String monthNames[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
-                        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
-  
+                         "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+
   int day = 0, month = 0, year = 0;
-  
-  // Try to parse YYYY-MM-DD format
+
   if (customDate.indexOf('-') != -1) {
-    int firstDash = customDate.indexOf('-');
+    int firstDash  = customDate.indexOf('-');
     int secondDash = customDate.indexOf('-', firstDash + 1);
-    
     if (firstDash != -1 && secondDash != -1) {
-      year = customDate.substring(0, firstDash).toInt();
+      year  = customDate.substring(0, firstDash).toInt();
       month = customDate.substring(firstDash + 1, secondDash).toInt();
-      day = customDate.substring(secondDash + 1).toInt();
+      day   = customDate.substring(secondDash + 1).toInt();
     }
-  }
-  // Try to parse DD/MM/YYYY format
-  else if (customDate.indexOf('/') != -1) {
-    int firstSlash = customDate.indexOf('/');
+  } else if (customDate.indexOf('/') != -1) {
+    int firstSlash  = customDate.indexOf('/');
     int secondSlash = customDate.indexOf('/', firstSlash + 1);
-    
     if (firstSlash != -1 && secondSlash != -1) {
-      day = customDate.substring(0, firstSlash).toInt();
+      day   = customDate.substring(0, firstSlash).toInt();
       month = customDate.substring(firstSlash + 1, secondSlash).toInt();
-      year = customDate.substring(secondSlash + 1).toInt();
+      year  = customDate.substring(secondSlash + 1).toInt();
     }
   }
-  
-  // Validate parsed values
+
   if (day < 1 || day > 31 || month < 1 || month > 12 || year < 1900 || year > 2100) {
     Serial.println("Invalid date format, using current date");
     return getFormattedDateTime();
   }
-  
-  // Calculate day of week (simplified algorithm - may not be 100% accurate for all dates)
-  // For a more accurate calculation, you might want to use a proper date library
-  int dayOfWeek = 0; // Default to Sunday if we can't calculate
-  
-  // Format: "Sat, 06 Jun 2025"
-  String formatted = dayNames[dayOfWeek] + ", ";
+
+  String formatted = "   , "; // Day-of-week skipped for custom dates
   formatted += String(day < 10 ? "0" : "") + String(day) + " ";
   formatted += monthNames[month - 1] + " ";
   formatted += String(year);
-  
+
   return formatted;
 }
 
@@ -327,37 +430,31 @@ String formatCustomDate(String customDate) {
 void initializePrinter() {
   printer.begin(9600);
   delay(500);
-  
-  // Initialise
-  printer.write(0x1B); printer.write('@'); // ESC @
+
+  printer.write(0x1B); printer.write('@');    // ESC @ — initialise
   delay(50);
-  
-  // Set stronger black fill (print density/heat)
-  printer.write(0x1B); printer.write('7');
-  printer.write(15); // Heating dots (max 15)
+
+  printer.write(0x1B); printer.write('7');    // ESC 7 — set heat config
+  printer.write(15);  // Heating dots (max 15)
   printer.write(150); // Heating time
   printer.write(250); // Heating interval
-  
-  // Enable 180° rotation (which also reverses the line order)
-  printer.write(0x1B); printer.write('{'); printer.write(0x01); // ESC { 1
-  
+
+  printer.write(0x1B); printer.write('{'); printer.write(0x01); // ESC { 1 — 180° rotation
+
   Serial.println("Printer initialized");
 }
 
 void printReceipt() {
   Serial.println("Printing receipt...");
-  
-  // Print wrapped message first (appears at bottom after rotation)
+
   printWrappedUpsideDown(currentReceipt.message);
-  
-  // Print header last (appears at top after rotation)
+
   setInverse(true);
   printLine(currentReceipt.timestamp);
   setInverse(false);
-  
-  // Advance paper
+
   advancePaper(2);
-  
+
   Serial.println("Receipt printed successfully");
 }
 
@@ -365,27 +462,21 @@ void printServerInfo() {
   Serial.println("=== Server Info ===");
   Serial.print("Local IP: ");
   Serial.println(WiFi.localIP());
-  Serial.print("Access the form at: http://");
-  Serial.println(WiFi.localIP());
   Serial.println("==================");
-  
-  // Also print server info on the thermal printer
-  Serial.println("Printing server info on thermal printer...");
-  
+
   String serverInfo = "Server started at " + WiFi.localIP().toString();
   printWrappedUpsideDown(serverInfo);
-  
+
   setInverse(true);
   printLine("PRINTER SERVER READY");
   setInverse(false);
-  
+
   advancePaper(3);
 }
 
-// === Original Printer Helper Functions ===
 void setInverse(bool enable) {
   printer.write(0x1D); printer.write('B');
-  printer.write(enable ? 1 : 0); // GS B n
+  printer.write(enable ? 1 : 0);
 }
 
 void printLine(String line) {
@@ -394,29 +485,28 @@ void printLine(String line) {
 
 void advancePaper(int lines) {
   for (int i = 0; i < lines; i++) {
-    printer.write(0x0A); // LF
+    printer.write(0x0A);
   }
 }
 
 void printWrappedUpsideDown(String text) {
   String lines[100];
   int lineCount = 0;
-  
+
   while (text.length() > 0) {
-    int breakIndex = maxCharsPerLine;
-    if (text.length() <= maxCharsPerLine) {
+    if (text.length() <= (unsigned int)maxCharsPerLine) {
       lines[lineCount++] = text;
       break;
     }
-    
+
     int lastSpace = text.lastIndexOf(' ', maxCharsPerLine);
     if (lastSpace == -1) lastSpace = maxCharsPerLine;
-    
+
     lines[lineCount++] = text.substring(0, lastSpace);
     text = text.substring(lastSpace);
     text.trim();
   }
-  
+
   for (int i = lineCount - 1; i >= 0; i--) {
     printLine(lines[i]);
   }
