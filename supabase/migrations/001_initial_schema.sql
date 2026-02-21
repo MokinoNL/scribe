@@ -2,6 +2,8 @@
 -- Scribe - Initial Schema
 -- ============================================================
 
+create extension if not exists pgcrypto;
+
 -- Households: a home that owns a printer and shares lists
 create table if not exists households (
   id          uuid primary key default gen_random_uuid(),
